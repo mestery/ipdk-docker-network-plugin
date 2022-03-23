@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,12 +38,13 @@ import (
 	ipamapi "github.com/docker/libnetwork/ipams/remote/api"
 	"github.com/golang/glog"
 	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
 )
 
 type epVal struct {
 	IP            string
 	vhostuserPort string //The dpdk vhost user port
-	vppInterface  string
+	ipdkInterface  string
 }
 
 type nwVal struct {
@@ -65,6 +67,7 @@ var nwMap struct {
 var brMap struct {
 	sync.Mutex
 	brCount int
+	intfCount int
 	m       map[string]int
 }
 
@@ -76,6 +79,7 @@ func init() {
 	nwMap.m = make(map[string]*nwVal)
 	brMap.m = make(map[string]int)
 	brMap.brCount = 1
+	brMap.intfCount = 1
 	dbFile = "/tmp/dpdk_bolt.db"
 }
 
@@ -150,7 +154,7 @@ func handlerCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		glog.Errorf("Unable to update db %v", err)
 	}
 
-	// For VPP, we are connecting endpoints via a bridge which requires
+	// For IPDK, we are connecting endpoints via a bridge which requires
 	// a unique integer ID.
 	brMap.Lock()
 	brMap.m[req.NetworkID] = brMap.brCount
@@ -279,17 +283,29 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	//Create a unique path on the host to place the socket
 	socketpath := fmt.Sprintf("/tmp/vhostuser_%s", ip)
-	err = os.Mkdir(socketpath, 0500)
+	glog.Infof("INFO: Creating directory %v", socketpath)
+	err = os.Mkdir(socketpath, 0755)
 	if err != nil {
 		resp.Err = fmt.Sprintf("Error making socket path %s: err: %v", socketpath, err)
 		sendResponse(resp, w)
 		return
 	}
 
-	//Generate VPP-dpdk vhost-user interface:
-	cmd := "vppctl"
-	args := []string{"create", "vhost", "socket", fmt.Sprintf("%s/vhu.sock", socketpath), "server"}
-	bifc, err := exec.Command(cmd, args...).Output()
+	// Create a unique name and host
+	ipdk_intf := brMap.intfCount
+	brMap.intfCount = brMap.intfCount + 1
+	netnamet := fmt.Sprintf("net_vhost%d", ipdk_intf)
+	netname := strings.Replace(netnamet, ".", "", -1)
+	nethostt := fmt.Sprintf("host_%d", ipdk_intf)
+	nethost := strings.Replace(nethostt, ".", "", -1)
+
+	//Generate IPDK vhost-user interface:
+	//docker exec -it ipdk gnmi-cli set "device:virtual-device,name:net_vhost0,host:host1,device-type:VIRTIO_NET,queues:1,socket-path:/tmp/vhost-user-0,port-type:LINK"
+	cmd := "docker"
+	args := []string{"exec", "ipdk", "gnmi-cli", "set", fmt.Sprintf("device:virtual-device,name:%s,host:%s,device-type:VIRTIO_NET,queues:1,socket-path:%s/vhu.sock,port-type:LINK", netname, nethost, socketpath)}
+	glog.Infof("INFO: Running command [%v] with args [%v]", cmd, args)
+	//if err := exec.Command(cmd, args...).Run(); err != nil {
+	output, err := exec.Command(cmd, args...).Output()
 	if err != nil {
 		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, args, err)
 		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
@@ -298,31 +314,28 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ifcb, _, err := bufio.NewReader(bytes.NewReader(bifc)).ReadLine()
+	ifcb, _, err := bufio.NewReader(bytes.NewReader(output)).ReadLine()
 	ifc := string(ifcb)
 
-	glog.Infof("Created vhost-user interface %v %v", ifc, err)
+	glog.Infof("INFO: Result of gnmi-cli command [%v]", ifc)
 
-	//Set Interface state to up
-	cmd = "vppctl"
-	args = []string{"set", "interface", "state", ifc, "up"}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
+	// Run ovs-p4ctl to add a pipeline entry
+	cmd = "docker"
+	args = []string{"exec", "ipdk", "ovs-p4ctl", "add-entry", "br0", "ingress.ipv4_host", fmt.Sprintf("hdr.ipv4.dst_addr=%s,action=ingress.send(%d)", ip, ipdk_intf)}
+	glog.Infof("INFO: Running command [%v] with args [%v]", cmd, args)
+	output, err = exec.Command(cmd, args...).Output()
+	if err != nil {
+		glog.Infof("ERROR: [%v] [%v] [%v] ", cmd, args, err)
+		resp.Err = fmt.Sprintf("Error ovs-p4ctl : [%v] [%v] [%v]",
 			cmd, args, err)
 		sendResponse(resp, w)
 		return
 	}
 
-	//Attach VPP vhost-user interface to VPP L2 Bridge Domain
-	//TODO: Need to create a unique bridge domain ID per network
-	cmd = "vppctl"
-	args = []string{"set", "interface", "l2", "bridge", ifc, fmt.Sprint(brMap.m[req.NetworkID])}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
-			cmd, args, err)
-		sendResponse(resp, w)
-		return
-	}
+	ifcb, _, err = bufio.NewReader(bytes.NewReader(output)).ReadLine()
+	ifc = string(ifcb)
+
+	glog.Infof("INFO: Result of ovs-p4ctl command [%v]", ifc)
 
 	/* Setup the dummy interface corresponding to the dpdk port
 	 * This is done so that docker CNM will program the IP Address
@@ -346,7 +359,7 @@ func handlerCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	epMap.m[req.EndpointID] = &epVal{
 		IP:            req.Interface.Address,
 		vhostuserPort: vhostPort,
-		vppInterface:  ifc,
+		ipdkInterface:  fmt.Sprintf("%d", brMap.intfCount),
 	}
 
 	if err := dbAdd("epMap", req.EndpointID, epMap.m[req.EndpointID]); err != nil {
@@ -378,7 +391,6 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	m := epMap.m[req.EndpointID]
 	vhostPort := m.vhostuserPort
-	vppInterface := m.vppInterface
 
 	delete(epMap.m, req.EndpointID)
 	if err := dbDelete("epMap", req.EndpointID); err != nil {
@@ -387,29 +399,12 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	nwMap.Unlock()
 	epMap.Unlock()
 
-	//put interface into down state
-	cmd := "vppctl"
-	args := []string{"set", "interface", "state", vppInterface, "down"}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
-			cmd, args, err)
-		sendResponse(resp, w)
-		return
-	}
-
-	//delete vhost interface
-	cmd = "vppctl"
-	args = []string{"delete", "vhost-user", vppInterface}
-	if err := exec.Command(cmd, args...).Run(); err != nil {
-		resp.Err = fmt.Sprintf("Error DeleteEndpoint: [%v] [%v] [%v]",
-			cmd, args, err)
-		sendResponse(resp, w)
-		return
-	}
+	// Need to delete port using openconfig when we can
 
 	//delete dummy port
-	cmd = "ip"
-	args = []string{"link", "del", vhostPort}
+	cmd := "ip"
+	args := []string{"link", "del", vhostPort}
+	glog.Infof("INFO: Deleting dummy port [%v]", vhostPort)
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		resp.Err = fmt.Sprintf("Error EndPointCreate: [%v] [%v] [%v]",
 			cmd, args, err)
@@ -420,7 +415,8 @@ func handlerDeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	glog.Infof("Deleted dummy port %v %v ", cmd, args)
 
 	// vhostPort contains the IP address
-	os.RemoveAll(fmt.Sprintf("/tmp/vhostuser_%s/", vhostPort))
+	glog.Infof("INFO: Removing directory and files at [/tmp/vhostuser_%v]", vhostPort)
+	os.RemoveAll(fmt.Sprintf("/tmp/vhostuser_%s", vhostPort))
 	if err != nil {
 		glog.Infof("Couldn't remove /tmp/vhostuser_%s", vhostPort)
 		resp.Err = fmt.Sprintf("Couldn't delete /tmp/vhostuser_%s: %v", vhostPort, err)
@@ -853,8 +849,53 @@ func initDb() error {
 	return err
 }
 
+func programP4() error {
+	cmd := "docker"
+	args := []string{"exec", "ipdk", "p4c", "--arch", "psa", "--target", "dpdk", "--output", "/root/examples/simple_l3/pipe", "--p4runtime-files", "/root/examples/simple_l3/p4Info.txt", "--bf-rt-schema", "/root/examples/simple_l3/bf-rt.json", "--context", "/root/examples/simple_l3/pipe/context.json", "/root/examples/simple_l3/simple_l3.p4"}
+	glog.Infof("INFO: Running command [%v] with args [%v]", cmd, args)
+	output, err := exec.Command(cmd, args...).Output()
+	if err != nil {
+		return fmt.Errorf("p4c building error [%v]", err)
+	}
+
+	ifcb, _, err := bufio.NewReader(bytes.NewReader(output)).ReadLine()
+	ifc := string(ifcb)
+
+	glog.Infof("INFO: Result of building p4c program [%v]", ifc)
+
+	cmd = "docker"
+	args = []string{"exec", "ipdk", "bash", "-c", "cd /root/examples/simple_l3 && ovs_pipeline_builder --p4c_conf_file=/root/examples/simple_l3/simple_l3.conf --bf_pipeline_config_binary_file=simple_l3.pb.bin"}
+	glog.Infof("INFO: Running command [%v] with args [%v]", cmd, args)
+	output, err = exec.Command(cmd, args...).Output()
+	if err != nil {
+		return fmt.Errorf("P4 programming error [%v]", err)
+	}
+
+	ifcb, _, err = bufio.NewReader(bytes.NewReader(output)).ReadLine()
+	ifc = string(ifcb)
+
+	glog.Infof("INFO: Result of P4 pipeline programming [%v]", ifc)
+
+	cmd = "docker"
+	args = []string{"exec", "ipdk", "bash", "-c", "cd /root/examples/simple_l3 && ovs-p4ctl set-pipe br0 /root/examples/simple_l3/simple_l3.pb.bin /root/examples/simple_l3/p4Info.txt"}
+	glog.Infof("INFO: Running command [%v] with args [%v]", cmd, args)
+	output, err = exec.Command(cmd, args...).Output()
+	if err != nil {
+		return fmt.Errorf("ovs-p4ctl error [%v]", err)
+	}
+
+	ifcb, _, err = bufio.NewReader(bytes.NewReader(output)).ReadLine()
+	ifc = string(ifcb)
+
+	glog.Infof("INFO: Result of ovs-p4ctl [%v]", ifc)
+
+	return nil
+}
+
 func main() {
 	flag.Parse()
+
+	godotenv.Load("~/.ipdk/ipdk.env")
 
 	if err := initDb(); err != nil {
 		glog.Fatalf("db init failed, quitting [%v]", err)

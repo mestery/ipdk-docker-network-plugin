@@ -1,51 +1,46 @@
-# cc_vpp
+# ipdk docker network plugin
 
-This is simple standalone Docker Plugin implementation to demonstrate Clear Containers with VPP.
+This is simple standalone Docker Plugin implementation to demonstrate Kata
+Containers v1 with [IPDK](https://ipdk.io). NOTE: v1 of Kata Containers has
+been deprecated. The reason we're using this version is that Docker does not
+support the V2 shim API, meaning Kata Containers v2 does not work with Docker
+(or podman, for that matter). See [here](https://github.com/kata-containers/kata-containers/issues/722)
+for more details.
 
-For more details about Clear Containers
-https://github.com/01org/cc-oci-runtime
-https://clearlinux.org/clear-containers
+For more details about Kata Containers v1:
+* [GitHub](https://github.com/kata-containers/kata-containers/tree/1.x-eol)
 
-For more information about VPP
-https://wiki.fd.io/view/VPP
+For more information about IPDL:
+* [IPDK Website](https://ipdk.io)
+* [IPDK GitHub](https://github.com/ipdk-io/ipdk)
 
-The docker plugin is used to create the VPP vhost-user interface which is attached to the clear container.
-Example below assumes you are using a Clear Container which has VPP enabling.  This can be found at
-https://github.com/01org/cc-oci-runtime/tree/networking/vhost-user-poc
+The docker plugin is used to create the IPDK vhost-user interface inside the IPDK
+docker container, which is attached to the kata container.
 
 # How to use this plugin
 
-
 0. Build this plugin. 
 
-        go build
+```
+$ go get
+$ go build
+```
 
 1. Ensure that your plugin is discoverable https://docs.docker.com/engine/extend/plugin_api/#/plugin-discovery
 
-        sudo cp vpp.json /etc/docker/plugins/
-
+```
+$ sudo cp ipdk.json /etc/docker/plugins/
+```
 
 2. Start the plugin
 
-        sudo ./vpp &
+```
+$ sudo ./ipdk-docker-network-plugin&
+```
         
-   Note: Enable password less sudo to ensure the plugin will run in the background without prompting.
+Note: Enable password less sudo to ensure the plugin will run in the background without prompting.
 
-3. Try VPP with Clear Containers
+3. Try IPDK with Kata Containers v1:
 
-        #Cleanup any old VPP interfaces
-        sudo service vpp stop
-        sudo service vpp start
-
-        #Create the VPP container network using the custom VPP docker driver
-        sudo docker network create -d=vpp --ipam-driver=vpp --subnet=192.168.1.0/24 --gateway=192.168.1.1 vpp_net
-
-        #Create docker containers, testing their connecivity over L2-bridge:
-        sudo docker run --net=vpp_net --ip=192.168.1.2 --mac-address=CA:FE:CA:FE:01:02 --name "hasvpp1" -itd debian bash
-        sudo docker run --net=vpp_net --ip=192.168.1.3 --mac-address=CA:FE:CA:FE:01:03 --name "hasvpp2" -it debian bash -c "ip a; ip route; ping 192.168.1.2"
-
-        #Cleanup
-        sudo docker kill `sudo docker ps --no-trunc -aq` ; sudo docker rm `sudo docker ps --no-trunc -aq`
-        sudo docker network rm vpp_net
-        sudo service vpp stop
-        sudo service vpp start
+Follow the instructions in the PoC repository to try this out in a Virtualbox
+environment.
